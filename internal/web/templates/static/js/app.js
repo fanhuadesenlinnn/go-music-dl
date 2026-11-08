@@ -29,9 +29,8 @@ const DEFAULT_UPDATE_REPO_URL = "https://github.com/guohuiyuan/go-music-dl";
 const DEFAULT_GITHUB_PROXY_URL = "https://edgeone.gh-proxy.com";
 const DEFAULT_DOWNLOAD_TIP_DURATION = 8;
 const OPEN_CONFIG_QUERY = "open_config";
-const SCHEDULED_PLAYBACK_STORAGE_KEY = "musicdl:scheduledPlayback";
-const SCHEDULED_PLAYBACK_REPEAT_ONCE = "once";
-const SCHEDULED_PLAYBACK_REPEAT_DAILY = "daily";
+const SCHEDULED_PLAYBACK_STORAGE_KEY = "musicdl:scheduledStop";
+const SCHEDULED_PLAYBACK_LEGACY_STORAGE_KEY = "musicdl:scheduledPlayback";
 const SCHEDULED_PLAYBACK_WAKE_INTERVAL_MS = 30000;
 const GITHUB_PROXY_PRESETS = [
   "https://edgeone.gh-proxy.com",
@@ -3827,6 +3826,7 @@ async function inspectSong(card, controller = null) {
   const source = card.dataset.source;
   const duration = card.dataset.duration;
   const extra = card.dataset.extra || "";
+  const requestInspectKey = card.dataset.inspectKey || "";
   let retryDelay = 0;
 
   const params = new URLSearchParams({
@@ -3856,6 +3856,7 @@ async function inspectSong(card, controller = null) {
     if (
       (signal && signal.aborted) ||
       !card.isConnected ||
+      card.dataset.inspectKey !== requestInspectKey ||
       !data ||
       typeof data !== "object"
     ) {
@@ -3880,6 +3881,7 @@ async function inspectSong(card, controller = null) {
     if (data.valid) {
       inspectRetryCounts.delete(card);
       delete card.dataset.inspectRetryable;
+      delete card.dataset.autoSwitchRetryable;
       card.dataset.inspectCompleted = "1";
       if (sizeTag) {
         sizeTag.textContent = data.size;
@@ -3908,6 +3910,12 @@ async function inspectSong(card, controller = null) {
       );
       retryDelay = recordInspectSourcePressure(source, suggestedDelay);
       card.dataset.inspectRetryable = "1";
+      const retryReason = String(data.reason || "").toLowerCase();
+      if (retryReason === "rate_limited") {
+        delete card.dataset.autoSwitchRetryable;
+      } else {
+        card.dataset.autoSwitchRetryable = "1";
+      }
       if (sizeTag) {
         sizeTag.textContent = "稍后重试";
         sizeTag.className = "tag tag-loading";
@@ -3922,6 +3930,7 @@ async function inspectSong(card, controller = null) {
     } else {
       inspectRetryCounts.delete(card);
       delete card.dataset.inspectRetryable;
+      delete card.dataset.autoSwitchRetryable;
       card.dataset.inspectCompleted = "1";
       if (sizeTag) {
         sizeTag.textContent = "无效";
@@ -3944,6 +3953,9 @@ async function inspectSong(card, controller = null) {
     ) {
       return;
     }
+    if (card.dataset.inspectKey !== requestInspectKey) {
+      return;
+    }
     retryDelay = recordInspectSourcePressure(
       source,
       parsePositiveInt(error?.retryAfterMs, 0),
@@ -3961,15 +3973,28 @@ async function inspectSong(card, controller = null) {
       const preparedRetryDelay = prepareInspectRetry(card, retryDelay);
       if (preparedRetryDelay > 0) {
         scheduleInspectRetry(card, preparedRetryDelay);
+      } else if (card.dataset.inspectRetryable === "1") {
+        card.dataset.autoSwitchRetryable = "1";
       }
     }
     if (controller) {
       finishInspectSong(controller);
     }
+    const requestIsStale =
+      card.isConnected && card.dataset.inspectKey !== requestInspectKey;
+    if (
+      requestIsStale &&
+      (!signal || !signal.aborted) &&
+      card.dataset.inspectCompleted !== "1"
+    ) {
+      queueInspectSong(card, 0);
+    }
     if (
       card.isConnected &&
       (!signal || !signal.aborted) &&
-      document.querySelector(".tag-fail")
+      card.dataset.inspectKey === requestInspectKey &&
+      (document.querySelector(".tag-fail") ||
+        card.dataset.autoSwitchRetryable === "1")
     ) {
       scheduleAutoSwitchInvalidSources();
     }
@@ -4222,6 +4247,8 @@ function queueInspectSong(card, delay = 0) {
   if (card.dataset.inspectKey !== inspectKey) {
     card.dataset.inspectKey = inspectKey;
     delete card.dataset.inspectCompleted;
+    delete card.dataset.inspectRetryable;
+    delete card.dataset.autoSwitchRetryable;
     inspectRetryCounts.delete(card);
   }
   if (card.dataset.inspectPending === "1") return;
@@ -6884,6 +6911,7 @@ let scheduledPlayback = null;
 let scheduledPlaybackTimer = null;
 let scheduledPlaybackTicker = null;
 let scheduledPlaybackTriggering = false;
+let scheduledPlaybackPresetNextAt = 0;
 
 function parseScheduledPlaybackTime(value) {
   const match = String(value || "")
@@ -6914,16 +6942,9 @@ function normalizeScheduledPlayback(raw, now = Date.now()) {
   if (!raw || typeof raw !== "object") return null;
   const parsed = parseScheduledPlaybackTime(raw.time);
   if (!parsed) return null;
-  const repeat =
-    raw.repeat === SCHEDULED_PLAYBACK_REPEAT_DAILY
-      ? SCHEDULED_PLAYBACK_REPEAT_DAILY
-      : SCHEDULED_PLAYBACK_REPEAT_ONCE;
-  let nextAt = Number(raw.nextAt);
-  if (!Number.isFinite(nextAt) || nextAt <= now) {
-    if (repeat !== SCHEDULED_PLAYBACK_REPEAT_DAILY) return null;
-    nextAt = nextScheduledPlaybackTimestamp(parsed.time, now);
-  }
-  return { time: parsed.time, repeat, nextAt };
+  const nextAt = Number(raw.nextAt);
+  if (!Number.isFinite(nextAt) || nextAt <= now) return null;
+  return { time: parsed.time, nextAt };
 }
 
 function readScheduledPlayback() {
@@ -6958,7 +6979,7 @@ function persistScheduledPlayback() {
       localStorage.removeItem(SCHEDULED_PLAYBACK_STORAGE_KEY);
     }
   } catch (error) {
-    console.warn("[music-dl] 无法保存定时播放设置:", error);
+    console.warn("[music-dl] 无法保存定时停止设置:", error);
   }
 }
 
@@ -7016,10 +7037,10 @@ function updateScheduledPlaybackUI() {
   if (button) {
     button.classList.toggle("is-scheduled", active);
     const label = active
-      ? `定时播放：${formatScheduledPlaybackDate(
+      ? `定时停止：${formatScheduledPlaybackDate(
           scheduledPlayback.nextAt,
         )}，还有 ${formatScheduledPlaybackCountdown(scheduledPlayback.nextAt)}`
-      : "定时播放";
+      : "定时停止";
     button.title = label;
     button.setAttribute("aria-label", label);
   }
@@ -7030,10 +7051,10 @@ function updateScheduledPlaybackUI() {
       : "";
   }
   if (statusTitle && statusCopy) {
-    statusTitle.textContent = active ? "已安排定时播放" : "尚未安排定时播放";
+    statusTitle.textContent = active ? "已设置定时停止" : "尚未设置定时停止";
     statusCopy.textContent = active
-      ? `${formatScheduledPlaybackDate(scheduledPlayback.nextAt)}自动开始播放`
-      : "选择时间后，播放器会在到点时自动开始播放当前清单。";
+      ? `${formatScheduledPlaybackDate(scheduledPlayback.nextAt)}自动暂停播放`
+      : "选择时间后，播放器会在到点时自动暂停，播放清单会保留。";
   }
   if (activePanel) activePanel.hidden = !active;
   if (activeTarget && activeCountdown && active) {
@@ -7070,75 +7091,30 @@ function checkScheduledPlayback() {
   void triggerScheduledPlayback();
 }
 
-async function triggerScheduledPlayback() {
+function triggerScheduledPlayback() {
   if (!scheduledPlayback || scheduledPlaybackTriggering) return;
   scheduledPlaybackTriggering = true;
-  const triggeredSchedule = {
-    ...scheduledPlayback,
-  };
-
-  if (triggeredSchedule.repeat === SCHEDULED_PLAYBACK_REPEAT_DAILY) {
-    scheduledPlayback = {
-      time: triggeredSchedule.time,
-      repeat: triggeredSchedule.repeat,
-      nextAt: nextScheduledPlaybackTimestamp(triggeredSchedule.time),
-    };
-  } else {
-    scheduledPlayback = null;
-  }
+  scheduledPlayback = null;
   persistScheduledPlayback();
   scheduleScheduledPlaybackWake();
   updateScheduledPlaybackUI();
 
   try {
-    if (!ap?.list?.audios?.length) {
-      showToast(
-        "定时播放已到",
-        "播放清单为空。请先选择歌曲，播放器会在下一次定时到点时尝试播放。",
-        "warning",
-        9000,
-      );
-      return;
-    }
     if (!ap?.audio) {
       throw new Error("播放器尚未准备好");
     }
-
-    if (ap.audio.paused) {
-      if (ap.audio.ended) ap.audio.currentTime = 0;
-      resumeVideoGenAudioRouting();
-      const playResult = ap.play();
-      if (playResult && typeof playResult.then === "function") {
-        await playResult;
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 600));
-    }
-
-    if (ap.audio.paused) {
-      showToast(
-        "浏览器拦截了自动播放",
-        "定时播放已触发，请手动点击底部播放按钮开始播放。",
-        "warning",
-        10000,
-      );
-      return;
-    }
-    const currentAudio = getCurrentAPlayerAudio();
-    const songLabel = currentAudio?.name
-      ? `《${currentAudio.name}》${currentAudio.artist ? ` - ${currentAudio.artist}` : ""}`
-      : "当前歌曲";
+    const wasPlaying = !ap.audio.paused && !ap.audio.ended;
+    ap.pause();
     showToast(
-      "定时播放已开始",
-      triggeredSchedule.repeat === SCHEDULED_PLAYBACK_REPEAT_DAILY
-        ? `${songLabel}，明天 ${triggeredSchedule.time} 将再次播放。`
-        : songLabel,
-      "success",
+      wasPlaying ? "定时停止已执行" : "定时停止已触发",
+      wasPlaying ? "播放器已暂停，播放清单会保留。" : "播放器当前已经处于暂停状态。",
+      wasPlaying ? "success" : "info",
       5000,
     );
   } catch (error) {
     showToast(
-      "定时播放失败",
-      error?.message || "无法启动播放，请手动点击播放按钮。",
+      "定时停止失败",
+      error?.message || "无法暂停播放器，请手动点击暂停按钮。",
       "error",
       9000,
     );
@@ -7150,33 +7126,33 @@ async function triggerScheduledPlayback() {
 }
 
 function defaultScheduledPlaybackTime() {
-  const target = new Date(Date.now() + 5 * 60 * 1000);
+  const target = new Date(Date.now() + 30 * 60 * 1000);
   return `${String(target.getHours()).padStart(2, "0")}:${String(
     target.getMinutes(),
   ).padStart(2, "0")}`;
 }
 
 function applyScheduledPlaybackPreset(minutes) {
-  const target = new Date(Date.now() + Number(minutes || 0) * 60 * 1000);
+  const duration = Math.min(
+    24 * 60,
+    Math.max(1, Number(minutes) || 0),
+  );
+  const target = new Date(Date.now() + duration * 60 * 1000);
   const input = document.getElementById("scheduled-playback-time");
   if (!input) return;
+  scheduledPlaybackPresetNextAt = target.getTime();
   input.value = `${String(target.getHours()).padStart(2, "0")}:${String(
     target.getMinutes(),
   ).padStart(2, "0")}`;
-  input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 function openScheduledPlaybackModal() {
   const modal = document.getElementById("scheduledPlaybackModal");
   const timeInput = document.getElementById("scheduled-playback-time");
-  const repeatSelect = document.getElementById("scheduled-playback-repeat");
+  scheduledPlaybackPresetNextAt = 0;
   if (timeInput) {
     timeInput.value =
       scheduledPlayback?.time || timeInput.value || defaultScheduledPlaybackTime();
-  }
-  if (repeatSelect) {
-    repeatSelect.value =
-      scheduledPlayback?.repeat || SCHEDULED_PLAYBACK_REPEAT_ONCE;
   }
   updateScheduledPlaybackUI();
   if (modal) modal.style.display = "flex";
@@ -7193,29 +7169,25 @@ function saveScheduledPlayback(event) {
   const timeValue = document.getElementById("scheduled-playback-time")?.value;
   const parsed = parseScheduledPlaybackTime(timeValue);
   if (!parsed) {
-    showToast("时间格式不正确", "请选择有效的播放时间。", "error");
+    showToast("时间格式不正确", "请选择有效的停止时间。", "error");
     return false;
   }
-  const repeatValue =
-    document.getElementById("scheduled-playback-repeat")?.value;
-  const repeat =
-    repeatValue === SCHEDULED_PLAYBACK_REPEAT_DAILY
-      ? SCHEDULED_PLAYBACK_REPEAT_DAILY
-      : SCHEDULED_PLAYBACK_REPEAT_ONCE;
+  const nextAt =
+    scheduledPlaybackPresetNextAt > Date.now()
+      ? scheduledPlaybackPresetNextAt
+      : nextScheduledPlaybackTimestamp(parsed.time);
   scheduledPlayback = {
     time: parsed.time,
-    repeat,
-    nextAt: nextScheduledPlaybackTimestamp(parsed.time),
+    nextAt,
   };
+  scheduledPlaybackPresetNextAt = 0;
   persistScheduledPlayback();
   scheduleScheduledPlaybackWake();
   updateScheduledPlaybackUI();
   closeScheduledPlaybackModal();
   showToast(
-    "定时播放已设置",
-    `${formatScheduledPlaybackDate(scheduledPlayback.nextAt)}自动开始播放${
-      repeat === SCHEDULED_PLAYBACK_REPEAT_DAILY ? "，每天重复" : ""
-    }。请保持页面运行。`,
+    "定时停止已设置",
+    `${formatScheduledPlaybackDate(scheduledPlayback.nextAt)}自动暂停播放。请保持页面运行。`,
     "success",
     5000,
   );
@@ -7224,15 +7196,21 @@ function saveScheduledPlayback(event) {
 
 function cancelScheduledPlayback(showFeedback = true) {
   scheduledPlayback = null;
+  scheduledPlaybackPresetNextAt = 0;
   persistScheduledPlayback();
   scheduleScheduledPlaybackWake();
   updateScheduledPlaybackUI();
   if (showFeedback) {
-    showToast("定时播放已取消", "播放器不会再按原计划自动开始播放。", "info", 3500);
+    showToast("定时停止已取消", "播放器不会再按原计划自动暂停。", "info", 3500);
   }
 }
 
 function initializeScheduledPlayback() {
+  try {
+    localStorage.removeItem(SCHEDULED_PLAYBACK_LEGACY_STORAGE_KEY);
+  } catch (_) {
+    // Legacy schedules are ignored even if local storage is unavailable.
+  }
   scheduledPlayback = readScheduledPlayback();
   scheduleScheduledPlaybackWake();
   updateScheduledPlaybackUI();
@@ -7250,6 +7228,12 @@ function initializeScheduledPlayback() {
       });
     });
 
+  document
+    .getElementById("scheduled-playback-time")
+    ?.addEventListener("input", () => {
+      scheduledPlaybackPresetNextAt = 0;
+    });
+
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) checkScheduledPlayback();
   });
@@ -7264,7 +7248,7 @@ function initializeScheduledPlayback() {
   window.addEventListener("pageshow", checkScheduledPlayback);
 }
 
-window.musicDlScheduledPlayback = {
+window.musicDlScheduledStop = {
   open: openScheduledPlaybackModal,
   cancel: cancelScheduledPlayback,
   getState: () => (scheduledPlayback ? { ...scheduledPlayback } : null),
@@ -8696,9 +8680,15 @@ function isAutoSwitchInvalidSourcesEnabled() {
 function getInvalidSongCards(root = document) {
   const seen = new Set();
   const cards = [];
-  root.querySelectorAll(".tag-fail").forEach((tag) => {
-    const card = tag.closest(".song-card");
-    if (!card || seen.has(card) || isLocalMusicSourceValue(card.dataset.source))
+  root.querySelectorAll(".song-card").forEach((card) => {
+    const hasInvalidTag = !!card.querySelector(".tag-fail");
+    const hasRetryableInspection =
+      card.dataset.autoSwitchRetryable === "1";
+    if (
+      (!hasInvalidTag && !hasRetryableInspection) ||
+      seen.has(card) ||
+      isLocalMusicSourceValue(card.dataset.source)
+    )
       return;
     if (card.dataset.autoSwitchInvalidAttempted === "1" && root === document)
       return;
