@@ -3879,18 +3879,37 @@ async function inspectSong(card, controller = null) {
       card.querySelector('[id^="bitrate-"]');
 
     if (data.valid) {
+      const previewOnly = data.preview_only === true;
       inspectRetryCounts.delete(card);
       delete card.dataset.inspectRetryable;
       delete card.dataset.autoSwitchRetryable;
       card.dataset.inspectCompleted = "1";
+      if (previewOnly) {
+        card.dataset.previewOnly = "1";
+      } else {
+        delete card.dataset.previewOnly;
+      }
       if (sizeTag) {
-        sizeTag.textContent = data.size;
-        sizeTag.className = "tag tag-success";
-        sizeTag.removeAttribute("title");
+        sizeTag.textContent = previewOnly
+          ? `${data.size || "-"} · 试听`
+          : data.size;
+        sizeTag.className = previewOnly
+          ? "tag tag-success tag-preview"
+          : "tag tag-success";
+        if (previewOnly) {
+          sizeTag.title = "Spotify 仅提供试听片段";
+        } else {
+          sizeTag.removeAttribute("title");
+        }
       }
       if (bitrateTag) {
-        bitrateTag.textContent = data.bitrate;
-        bitrateTag.className = "tag";
+        bitrateTag.textContent = previewOnly ? "试听" : data.bitrate;
+        bitrateTag.className = previewOnly ? "tag tag-preview" : "tag";
+        if (previewOnly) {
+          bitrateTag.title = "试听可用，不会自动换源";
+        } else {
+          bitrateTag.removeAttribute("title");
+        }
       }
       card.dataset.sortSize = String(parseSizeToBytes(data.size));
       card.dataset.sortBitrate = String(parseBitrateToKbps(data.bitrate));
@@ -3904,6 +3923,7 @@ async function inspectSong(card, controller = null) {
       }
       recordInspectSourceSuccess(source);
     } else if (data.retryable === true || data.status === "retryable") {
+      delete card.dataset.previewOnly;
       const suggestedDelay = Math.max(
         parsePositiveInt(data.retry_after_ms, 0),
         parseInspectRetryAfter(response.headers.get("Retry-After")),
@@ -3928,6 +3948,7 @@ async function inspectSong(card, controller = null) {
         bitrateTag.className = "tag";
       }
     } else {
+      delete card.dataset.previewOnly;
       inspectRetryCounts.delete(card);
       delete card.dataset.inspectRetryable;
       delete card.dataset.autoSwitchRetryable;
@@ -3960,6 +3981,7 @@ async function inspectSong(card, controller = null) {
       source,
       parsePositiveInt(error?.retryAfterMs, 0),
     );
+    delete card.dataset.previewOnly;
     const el = card.querySelector('[id^="size-"]');
     if (el) el.textContent = "检测失败";
   } finally {
@@ -5594,6 +5616,54 @@ async function pickDownloadFolder() {
   }
 }
 
+let openDownloadDirectoryInFlight = false;
+
+async function openDownloadDirectory() {
+  if (openDownloadDirectoryInFlight) return;
+  openDownloadDirectoryInFlight = true;
+  const buttons = Array.from(
+    document.querySelectorAll('[onclick="openDownloadDirectory()"]'),
+  );
+  buttons.forEach((button) => {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  });
+  showToast("正在打开下载目录", "正在请求本机打开下载文件夹", "info", 1800);
+  try {
+    const response = await fetch(`${API_ROOT}/open_download_dir`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body: "{}",
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || "当前环境无法打开下载目录");
+    }
+    showToast(
+      "已打开下载目录",
+      payload.path || webSettings.downloadDir,
+      "success",
+      4000,
+    );
+  } catch (error) {
+    showToast(
+      "无法打开下载目录",
+      String(error?.message || error),
+      "error",
+      6000,
+    );
+  } finally {
+    openDownloadDirectoryInFlight = false;
+    buttons.forEach((button) => {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    });
+  }
+}
+
 function proxiedGithubURL(rawURL, proxyURL, enabled) {
   if (!enabled || !rawURL || !rawURL.startsWith("https://github.com/")) {
     return rawURL;
@@ -5684,16 +5754,50 @@ async function openLatestUpdatePage(target = "download") {
   openClientExternalURL(url, popup);
 }
 
+let systemConfigLoadSequence = 0;
+let systemConfigLoadController = null;
+
+function setSystemConfigLoading(loading) {
+  const modal = document.getElementById("cookieModal");
+  const saveButton = document.getElementById("settings-save-button");
+  if (modal) {
+    modal.setAttribute("aria-busy", String(loading));
+  }
+  if (!saveButton) return;
+  saveButton.disabled = loading;
+  saveButton.setAttribute("aria-busy", String(loading));
+  saveButton.textContent = loading ? "正在加载设置..." : "保存设置";
+}
+
 async function openSystemConfig(initialTab = "general") {
   const modal = document.getElementById("cookieModal");
+  const requestSequence = ++systemConfigLoadSequence;
+  systemConfigLoadController?.abort();
+  const controller = new AbortController();
+  systemConfigLoadController = controller;
+
+  // Open from the cached settings immediately. Auto source switching can keep
+  // the same-origin request slots busy, but it must not delay this dialog.
+  if (modal) modal.style.display = "flex";
+  bindSettingsTabs();
+  setSettingsTab(initialTab);
+  setSystemConfigLoading(true);
+
   try {
     const [cookiesResponse, settingsResponse] = await Promise.all([
-      fetch(API_ROOT + "/cookies", { headers: { Accept: "application/json" } }),
-      fetch(API_ROOT + "/settings"),
+      fetch(API_ROOT + "/cookies", {
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      }),
+      fetch(API_ROOT + "/settings", { signal: controller.signal }),
     ]);
     const cookies = await cookiesResponse.json().catch(() => null);
     const settings = await settingsResponse.json().catch(() => null);
-    if (handleConfigAuthResponse(cookiesResponse, cookies)) return;
+    if (requestSequence !== systemConfigLoadSequence) return;
+    if (handleConfigAuthResponse(cookiesResponse, cookies)) {
+      if (modal) modal.style.display = "none";
+      return;
+    }
     if (!cookiesResponse.ok || !settingsResponse.ok) {
       throw new Error("加载系统配置失败");
     }
@@ -5705,10 +5809,21 @@ async function openSystemConfig(initialTab = "general") {
     bindSettingsTabs();
     setSettingsTab(initialTab);
     setAuthFloatLoggedIn(true);
-    if (modal) modal.style.display = "flex";
   } catch (error) {
+    if (
+      requestSequence !== systemConfigLoadSequence ||
+      error?.name === "AbortError"
+    ) {
+      return;
+    }
+    if (modal) modal.style.display = "none";
     applyWebSettings(webSettings);
     showToast("系统配置加载失败", error.message || "请稍后重试", "error");
+  } finally {
+    if (requestSequence === systemConfigLoadSequence) {
+      systemConfigLoadController = null;
+      setSystemConfigLoading(false);
+    }
   }
 }
 
@@ -8313,6 +8428,7 @@ function updateCardWithSong(card, song, options = {}) {
   if (!card || !song) return;
   const oldId = card.dataset.id;
   const shouldInspect = options.inspect !== false;
+  delete card.dataset.previewOnly;
 
   card.dataset.id = song.id;
   card.dataset.source = song.source;
@@ -8687,6 +8803,7 @@ function getInvalidSongCards(root = document) {
     if (
       (!hasInvalidTag && !hasRetryableInspection) ||
       seen.has(card) ||
+      card.dataset.previewOnly === "1" ||
       isLocalMusicSourceValue(card.dataset.source)
     )
       return;
