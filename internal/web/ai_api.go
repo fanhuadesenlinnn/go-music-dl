@@ -339,6 +339,16 @@ func aiEndpointCatalog(basePath string) []aiEndpoint {
 		{
 			Group:       "downloads",
 			Method:      http.MethodPost,
+			Path:        basePath + "/api/downloads/records/{id}/reveal",
+			Description: "Existing route to reveal one completed download in the host file manager.",
+			Params:      map[string]string{"id": "required download record id"},
+			Returns:     "json",
+			Write:       true,
+			Auth:        writeAuth,
+		},
+		{
+			Group:       "downloads",
+			Method:      http.MethodPost,
 			Path:        basePath + "/api/downloads/precheck",
 			Description: "Existing read-only check for songs that are already downloaded.",
 			Body:        map[string]string{"songs": "array of {name,artist}; maximum 20000"},
@@ -389,8 +399,8 @@ func aiEndpointCatalog(basePath string) []aiEndpoint {
 			Group:       "downloads",
 			Method:      http.MethodPost,
 			Path:        basePath + "/api/downloads/queue/{id}/{action}",
-			Description: "Existing route to retry or cancel one queue task.",
-			Params:      map[string]string{"id": "required task id", "action": "retry or cancel"},
+			Description: "Existing route to retry, cancel, or reveal one queue task.",
+			Params:      map[string]string{"id": "required task id", "action": "retry, cancel, or reveal"},
 			Returns:     "json",
 			Write:       true,
 			Auth:        writeAuth,
@@ -427,6 +437,16 @@ func aiEndpointCatalog(basePath string) []aiEndpoint {
 				"collection_id": "optional imported collection id",
 			},
 			Returns: "json",
+		},
+		{
+			Group:       "library",
+			Method:      http.MethodPost,
+			Path:        basePath + "/local_music/reveal",
+			Description: "Existing route to reveal one indexed local music file in the host file manager. Available only to a loopback client.",
+			Params:      map[string]string{"id": "required local music id"},
+			Returns:     "json",
+			Write:       true,
+			Auth:        writeAuth,
 		},
 		{
 			Group:       "library",
@@ -762,6 +782,7 @@ Playback and downloads:
 
 Library and health:
 - Local music: GET %[1]s/local_music?offset=0&limit=50
+- Reveal one local music file: POST %[1]s/local_music/reveal?id=... (loopback clients only)
 - Local collections: GET %[1]s/collections
 - Collection songs: GET %[1]s/collections/{id}/songs
 - Health: GET %[1]s/healthz
